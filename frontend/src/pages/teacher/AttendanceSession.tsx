@@ -1,0 +1,484 @@
+import { useState, useEffect, useRef } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import api, { getErrorMessage } from '../../lib/api';
+import { PageHeader } from '../../components/ui/PageHeader';
+import { Upload, Check, X, Send, Camera, ArrowLeft, AlertCircle, BarChart3, Download } from 'lucide-react';
+import clsx from 'clsx';
+
+type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'LATE' | 'EXCUSED';
+
+export default function AttendanceSession() {
+  const { scheduleId } = useParams<{ scheduleId: string }>();
+  const navigate = useNavigate();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [session, setSession] = useState<any>(null);
+  const [records, setRecords] = useState<any[]>([]);
+  const [classInfo, setClassInfo] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [aiResult, setAiResult] = useState<any>(null);
+
+  useEffect(() => {
+    startSession();
+  }, [scheduleId]);
+
+  const startSession = async () => {
+    try {
+      // First get class details
+      const classRes = await api.get(`/teacher/classes/${scheduleId}`);
+      setClassInfo(classRes.data.data);
+
+      // Start or resume session
+      try {
+        const sessionRes = await api.post(`/teacher/classes/${scheduleId}/attendance/start`);
+        setSession(sessionRes.data.data);
+        // Fetch session details with records
+        await fetchSessionDetails(sessionRes.data.data.id);
+      } catch (err: any) {
+        // Session might already exist (409)
+        if (err.response?.status === 409) {
+          const existingId = err.response.data?.error?.details?.existingSessionId;
+          if (existingId) {
+            await fetchSessionDetails(existingId);
+          } else {
+            setError('An attendance session already exists and is locked.');
+          }
+        } else {
+          setError(getErrorMessage(err));
+        }
+      }
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchSessionDetails = async (sessionId: string) => {
+    const { data } = await api.get(`/teacher/attendance/${sessionId}`);
+    setSession(data.data);
+    setRecords(data.data.attendanceRecords || []);
+  };
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !session) return;
+
+    setUploading(true);
+    setAiResult(null);
+    try {
+      const formData = new FormData();
+      formData.append('image', file);
+
+      const { data } = await api.post(
+        `/teacher/attendance/${session.id}/process-image`,
+        formData,
+        { headers: { 'Content-Type': undefined } }
+      );
+
+      setAiResult(data.data);
+      if (data.data.attendanceRecords) {
+        setRecords(data.data.attendanceRecords);
+      } else {
+        // Refresh records if AI was unavailable
+        await fetchSessionDetails(session.id);
+      }
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setUploading(false);
+      // Reset file input so the same file can be re-uploaded
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const updateStatus = async (studentId: string, status: AttendanceStatus) => {
+    if (!session) return;
+    try {
+      await api.put(`/teacher/attendance/${session.id}/students/${studentId}`, { status });
+      setRecords((prev) =>
+        prev.map((r) => (r.studentId === studentId ? { ...r, status } : r))
+      );
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!session || submitting) return;
+    setSubmitting(true);
+    try {
+      await api.post(`/teacher/attendance/${session.id}/submit`);
+      navigate('/teacher', { replace: true });
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDownloadExcel = async () => {
+    if (!session) return;
+    try {
+      const res = await api.get(`/teacher/attendance/${session.id}/download-excel`, {
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      const disposition = res.headers['content-disposition'];
+      const filename = disposition?.match(/filename="(.+)"/)?.[1] || 'attendance.xlsx';
+      link.setAttribute('download', filename);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="w-8 h-8 border-2 border-maroon-700/30 border-t-maroon-600 rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  const isLocked = session?.status === 'SUBMITTED' || session?.status === 'FINALIZED';
+  const presentCount = records.filter((r) => r.status === 'PRESENT').length;
+  const lateCount = records.filter((r) => r.status === 'LATE').length;
+  const absentCount = records.filter((r) => r.status === 'ABSENT').length;
+
+  return (
+    <div>
+      <PageHeader
+        title={classInfo?.courseOffering?.course?.name || 'Attendance'}
+        description={`${classInfo?.classroom?.name || ''} | ${classInfo?.startTime} - ${classInfo?.endTime}`}
+        action={
+          <button onClick={() => navigate('/teacher')} className="flex items-center gap-2 text-sm text-white/50 hover:text-white/80">
+            <ArrowLeft size={16} /> Back
+          </button>
+        }
+      />
+
+      {error && (
+        <div className="mb-4 bg-maroon-900/30 border border-maroon-600/30 text-maroon-300 rounded-xl px-4 py-3 text-sm flex items-center gap-2">
+          <AlertCircle size={16} /> {error}
+          <button onClick={() => setError('')} className="ml-auto text-maroon-300 hover:text-white"><X size={16} /></button>
+        </div>
+      )}
+
+      {/* Stats bar */}
+      <div className="grid grid-cols-4 gap-3 mb-6">
+        <div className="glass p-3 text-center">
+          <p className="text-white/95 text-2xl font-bold">{records.length}</p>
+          <p className="text-white/40 text-xs">Total</p>
+        </div>
+        <div className="glass p-3 text-center border-green-500/20">
+          <p className="text-green-400 text-2xl font-bold">{presentCount}</p>
+          <p className="text-green-400/60 text-xs">Present</p>
+        </div>
+        <div className="glass p-3 text-center border-amber-500/20">
+          <p className="text-amber-400 text-2xl font-bold">{lateCount}</p>
+          <p className="text-amber-400/60 text-xs">Late</p>
+        </div>
+        <div className="glass p-3 text-center border-red-500/20">
+          <p className="text-red-400 text-2xl font-bold">{absentCount}</p>
+          <p className="text-red-400/60 text-xs">Absent</p>
+        </div>
+      </div>
+
+      {/* Image upload area */}
+      {!isLocked && (
+        <div className="mb-6">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleImageUpload}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="w-full flex items-center justify-center gap-3 py-6 glass-md border-2 border-dashed border-white/10 hover:border-maroon-600/30 hover:bg-maroon-700/5 rounded-xl transition-colors disabled:opacity-50"
+          >
+            {uploading ? (
+              <>
+                <div className="w-5 h-5 border-2 border-maroon-700/30 border-t-maroon-600 rounded-full animate-spin" />
+                <span className="text-sm text-white/50">Processing image with AI...</span>
+              </>
+            ) : (
+              <>
+                <Camera size={24} className="text-white/50" />
+                <span className="text-sm text-white/50">
+                  <span className="text-maroon-400 font-medium">Upload class photo</span> for automatic recognition
+                </span>
+              </>
+            )}
+          </button>
+
+          {aiResult && (
+            <div className="mt-2 text-sm text-white/70 glass bg-maroon-700/5 border-maroon-600/10 rounded-lg px-4 py-2">
+              {aiResult.aiServiceAvailable
+                ? `AI detected ${aiResult.facesDetected} faces, recognized ${aiResult.facesRecognized} students (${aiResult.processingTimeMs}ms)`
+                : aiResult.message
+              }
+            </div>
+          )}
+
+          {/* Accuracy Metrics Panel */}
+          {aiResult?.metrics && (() => {
+            const recognized = aiResult.recognizedStudents || [];
+            const highConf = recognized.filter((s: any) => s.distance < 0.5).length;
+            const medConf = recognized.filter((s: any) => s.distance >= 0.5 && s.distance < 0.7).length;
+            const lowConf = recognized.filter((s: any) => s.distance >= 0.7).length;
+            return (
+            <div className="mt-3 glass rounded-xl overflow-hidden">
+              <div className="px-4 py-2 border-b border-white/[0.06] flex items-center gap-2">
+                <BarChart3 size={14} className="text-maroon-400" />
+                <span className="text-xs text-white/40 uppercase font-semibold">Performance & Accuracy Metrics</span>
+              </div>
+
+              {/* Top-level stats */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-white/[0.04]">
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Recognition Rate</p>
+                  <p className="text-lg font-bold text-maroon-400">{aiResult.metrics.recognitionRate}%</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Threshold</p>
+                  <p className="text-lg font-bold text-white/80">{aiResult.metrics.threshold}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Avg Confidence</p>
+                  <p className="text-lg font-bold text-green-400">{aiResult.metrics.avgConfidence != null ? `${aiResult.metrics.avgConfidence}%` : '—'}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Processing Time</p>
+                  <p className="text-lg font-bold text-white/80">{(aiResult.metrics.processingTimeMs / 1000).toFixed(1)}s</p>
+                </div>
+              </div>
+
+              {/* Distance stats + Match quality tiers */}
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-px bg-white/[0.04]">
+                <div className="bg-[#0a0a0f] px-4 py-2">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Avg Distance</p>
+                  <p className="text-sm font-semibold text-white/70">{aiResult.metrics.avgDistance ?? '—'}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-2">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Min Distance</p>
+                  <p className="text-sm font-semibold text-white/70">{aiResult.metrics.minDistance ?? '—'}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-2">
+                  <p className="text-white/30 text-[10px] uppercase font-medium">Max Distance</p>
+                  <p className="text-sm font-semibold text-white/70">{aiResult.metrics.maxDistance ?? '—'}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-2">
+                  <p className="text-green-400/50 text-[10px] uppercase font-medium">High &lt;0.5</p>
+                  <p className="text-sm font-semibold text-green-400">{highConf}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-2">
+                  <p className="text-amber-400/50 text-[10px] uppercase font-medium">Medium 0.5-0.7</p>
+                  <p className="text-sm font-semibold text-amber-400">{medConf}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-2">
+                  <p className="text-red-400/50 text-[10px] uppercase font-medium">Low &gt;0.7</p>
+                  <p className="text-sm font-semibold text-red-400">{lowConf}</p>
+                </div>
+              </div>
+
+              {/* Per-student accuracy table */}
+              {recognized.length > 0 && (
+                <div className="border-t border-white/[0.04]">
+                  <div className="px-4 py-2 border-b border-white/[0.04]">
+                    <span className="text-[10px] text-white/30 uppercase font-semibold">Per-Student Breakdown</span>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-white/[0.04] text-white/30">
+                          <th className="px-4 py-1.5 text-left font-medium">Student</th>
+                          <th className="px-3 py-1.5 text-right font-medium">Distance</th>
+                          <th className="px-3 py-1.5 text-right font-medium">Confidence</th>
+                          <th className="px-4 py-1.5 text-right font-medium">Accuracy</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...recognized]
+                          .sort((a: any, b: any) => a.distance - b.distance)
+                          .map((s: any, i: number) => {
+                            const accuracy = Math.max(0, Math.min(100, (1 - s.distance / 1.2) * 100));
+                            const tierColor = s.distance < 0.5
+                              ? 'text-green-400'
+                              : s.distance < 0.7
+                              ? 'text-amber-400'
+                              : 'text-red-400';
+                            return (
+                              <tr key={i} className="border-b border-white/[0.03]">
+                                <td className="px-4 py-1.5 text-white/70">
+                                  <span className="text-white/40 mr-1.5">{s.registrationNumber}</span>
+                                  {s.name}
+                                </td>
+                                <td className={clsx('px-3 py-1.5 text-right font-mono', tierColor)}>
+                                  {s.distance.toFixed(4)}
+                                </td>
+                                <td className="px-3 py-1.5 text-right font-mono text-white/60">
+                                  {s.confidence.toFixed(1)}%
+                                </td>
+                                <td className="px-4 py-1.5 text-right">
+                                  <div className="flex items-center justify-end gap-2">
+                                    <div className="w-16 h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
+                                      <div
+                                        className={clsx('h-full rounded-full', {
+                                          'bg-green-500': accuracy >= 60,
+                                          'bg-amber-500': accuracy >= 40 && accuracy < 60,
+                                          'bg-red-500': accuracy < 40,
+                                        })}
+                                        style={{ width: `${accuracy}%` }}
+                                      />
+                                    </div>
+                                    <span className="font-mono text-white/50 w-10 text-right">{accuracy.toFixed(0)}%</span>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              <div className="px-4 py-2 border-t border-white/[0.04] flex gap-4 text-[10px] text-white/30">
+                <span>Enrolled: {aiResult.metrics.enrolledStudents}</span>
+                <span>With Encodings: {aiResult.metrics.studentsWithEncodings}</span>
+                <span>Image: {aiResult.metrics.imageWidth}x{aiResult.metrics.imageHeight}</span>
+                <span>Unknown Faces: {aiResult.metrics.unknownFaces}</span>
+              </div>
+            </div>
+            );
+          })()}
+
+          {/* Annotated image with face recognition results */}
+          {aiResult?.annotatedImageBase64 && (
+            <div className="mt-3 glass rounded-xl overflow-hidden">
+              <div className="px-4 py-2 border-b border-white/[0.06] flex items-center justify-between">
+                <span className="text-xs text-white/40 uppercase font-semibold">Recognition Result</span>
+                <span className="text-xs text-white/30">
+                  {aiResult.facesRecognized}/{aiResult.facesDetected} matched
+                </span>
+              </div>
+              <div className="p-2">
+                <img
+                  src={`data:image/jpeg;base64,${aiResult.annotatedImageBase64}`}
+                  alt="Annotated class photo with face recognition"
+                  className="w-full rounded-lg"
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Attendance records table */}
+      <div className="glass overflow-hidden">
+        <table className="min-w-full">
+          <thead>
+            <tr className="border-b border-white/[0.06]">
+              <th className="px-4 py-3 text-left text-white/40 uppercase text-xs font-semibold">Reg #</th>
+              <th className="px-4 py-3 text-left text-white/40 uppercase text-xs font-semibold">Name</th>
+              <th className="px-4 py-3 text-left text-white/40 uppercase text-xs font-semibold">Status</th>
+              {!isLocked && <th className="px-4 py-3 text-left text-white/40 uppercase text-xs font-semibold">Actions</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {records.map((record) => (
+              <tr key={record.id} className="border-b border-white/[0.04]">
+                <td className="px-4 py-3 text-sm text-white/50">{record.student?.registrationNumber}</td>
+                <td className="px-4 py-3 text-sm text-white/90 font-medium">
+                  {record.student?.firstName} {record.student?.lastName}
+                </td>
+                <td className="px-4 py-3">
+                  <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', {
+                    'bg-green-500/20 text-green-400': record.status === 'PRESENT',
+                    'bg-red-500/20 text-red-400': record.status === 'ABSENT',
+                    'bg-amber-500/20 text-amber-400': record.status === 'LATE',
+                    'bg-blue-500/20 text-blue-400': record.status === 'EXCUSED',
+                  })}>
+                    {record.status}
+                  </span>
+                </td>
+                {!isLocked && (
+                  <td className="px-4 py-3">
+                    <div className="flex gap-1">
+                      {(['PRESENT', 'ABSENT', 'LATE', 'EXCUSED'] as AttendanceStatus[]).map((status) => (
+                        <button
+                          key={status}
+                          onClick={() => updateStatus(record.studentId, status)}
+                          className={clsx('px-2 py-1 text-xs rounded font-medium transition-colors', {
+                            'bg-green-500 text-white': status === 'PRESENT' && record.status === status,
+                            'bg-green-500/10 text-green-400 hover:bg-green-500/20': status === 'PRESENT' && record.status !== status,
+                            'bg-red-500 text-white': status === 'ABSENT' && record.status === status,
+                            'bg-red-500/10 text-red-400 hover:bg-red-500/20': status === 'ABSENT' && record.status !== status,
+                            'bg-amber-500 text-black': status === 'LATE' && record.status === status,
+                            'bg-amber-500/10 text-amber-400 hover:bg-amber-500/20': status === 'LATE' && record.status !== status,
+                            'bg-blue-500 text-white': status === 'EXCUSED' && record.status === status,
+                            'bg-blue-500/10 text-blue-400 hover:bg-blue-500/20': status === 'EXCUSED' && record.status !== status,
+                          })}
+                        >
+                          {status.charAt(0)}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Submit & Download buttons */}
+      {!isLocked && records.length > 0 && (
+        <div className="mt-6 flex justify-end gap-3">
+          <button
+            onClick={handleDownloadExcel}
+            className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 text-white rounded-lg font-medium text-sm transition-colors"
+          >
+            <Download size={16} />
+            Download Attendance Sheet
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={submitting}
+            className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-green-600 to-green-700 hover:from-green-500 hover:to-green-600 text-white rounded-lg disabled:opacity-50 font-medium text-sm transition-colors"
+          >
+            <Send size={16} />
+            {submitting ? 'Submitting...' : 'Submit Attendance'}
+          </button>
+        </div>
+      )}
+
+      {isLocked && (
+        <div className="mt-6 flex flex-col items-center gap-3">
+          <div className="text-center text-sm glass bg-green-500/10 border-green-500/20 text-green-400 rounded-lg py-3 w-full">
+            <Check size={16} className="inline mr-1" /> Attendance has been submitted and locked
+          </div>
+          <button
+            onClick={handleDownloadExcel}
+            className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 text-white rounded-lg font-medium text-sm transition-colors"
+          >
+            <Download size={16} />
+            Download Attendance Sheet
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

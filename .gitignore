@@ -1,0 +1,89 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build outputs
+dist/
+build/
+*.spec
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.pkl
+venv/
+.venv/
+
+# AI model data & encodings
+ai-service/data/encodings/
+ai-service/data/svm_model/
+ai-service/storage/
+ai-service/encodings/
+ai-service/svm_model/
+
+# Dataset & training data (too large for git)
+Data received/
+Data received.zip
+
+# Uploaded files / storage
+backend/storage/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Test/output images
+*.jpg
+*.jpeg
+*.png
+!frontend/public/**
+!presentation_charts/**
+output/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Misc build artifacts
+build_installer.bat
+build_simple.bat
+installer_script.iss
+BUILD_INSTRUCTIONS.txt
+
+# Presentation charts (generated)
+presentation_charts/
+
+# Old standalone scripts
+face_recognition_attendance.py
+face_recognition_mediapipe.py
+face_recognition_attendance.spec
+FaceRecognitionAttendance.spec
+
+# Jupyter notebooks
+*.ipynb
+
+# Claude
+.claude/
+
+# Frontend build cache
+frontend/.vite/
