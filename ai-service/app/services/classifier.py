@@ -1,7 +1,9 @@
 """
 SVM classifier for face recognition.
-Trained on stored FaceNet embeddings; provides predict + probability.
-Used as an ensemble with distance-based matching.
+Trained on stored ArcFace embeddings; provides predict + probability.
+Used as an ensemble signal alongside cosine distance and centroid matching.
+
+Uses cross-validated grid search to find optimal hyperparameters.
 """
 
 import os
@@ -12,6 +14,7 @@ from typing import Optional, Dict, List
 import numpy as np
 from sklearn.svm import SVC
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import GridSearchCV
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +48,13 @@ class FaceClassifier:
 
     def train(self, encodings_by_student: Dict[str, np.ndarray]) -> Dict:
         """
-        Train SVM on all student encodings.
-        encodings_by_student: {student_id: np.ndarray of shape (N, 128)}
+        Train SVM on all student encodings with grid search for best hyperparams.
+        encodings_by_student: {student_id: np.ndarray of shape (N, D)}
+        Accepts either raw 512-d or projected 128-d encodings.
         """
         X, y = [], []
         for student_id, encs in encodings_by_student.items():
             if encs is not None and len(encs) > 0:
-                # L2-normalize
                 norms = np.linalg.norm(encs, axis=1, keepdims=True)
                 norms = np.where(norms > 0, norms, 1)
                 normed = encs / norms
@@ -69,28 +72,49 @@ class FaceClassifier:
         self.label_encoder = LabelEncoder()
         y_encoded = self.label_encoder.fit_transform(y)
 
-        self.svm = SVC(
-            kernel="rbf",
-            C=10.0,
-            gamma="scale",
-            probability=True,
-            class_weight="balanced",
-        )
-        self.svm.fit(X, y_encoded)
+        n_classes = len(set(y))
+
+        # For small datasets or few classes, use fixed params (grid search needs enough data)
+        if len(X) < 50 or n_classes < 5:
+            self.svm = SVC(
+                kernel="rbf", C=10.0, gamma="scale",
+                probability=True, class_weight="balanced",
+            )
+            self.svm.fit(X, y_encoded)
+            best_params = {"C": 10.0, "gamma": "scale"}
+        else:
+            # Grid search for optimal C and gamma
+            param_grid = {
+                "C": [1, 10, 50, 100],
+                "gamma": ["scale", "auto"],
+            }
+            gs = GridSearchCV(
+                SVC(kernel="rbf", probability=True, class_weight="balanced"),
+                param_grid,
+                cv=min(3, n_classes),  # k-fold limited by class count
+                scoring="accuracy",
+                n_jobs=-1,
+                refit=True,
+            )
+            gs.fit(X, y_encoded)
+            self.svm = gs.best_estimator_
+            best_params = gs.best_params_
+            logger.info(f"SVM grid search best params: {best_params}, score={gs.best_score_:.3f}")
+
         self.is_trained = True
 
-        # Save
         os.makedirs(CLASSIFIER_DIR, exist_ok=True)
         with open(CLASSIFIER_PATH, "wb") as f:
             pickle.dump(self.svm, f)
         with open(LABEL_ENCODER_PATH, "wb") as f:
             pickle.dump(self.label_encoder, f)
 
-        logger.info(f"SVM trained: {len(set(y))} classes, {len(X)} samples")
+        logger.info(f"SVM trained: {n_classes} classes, {len(X)} samples")
         return {
             "success": True,
-            "classes": int(len(set(y))),
+            "classes": int(n_classes),
             "samples": int(len(X)),
+            "bestParams": best_params,
         }
 
     def predict(
@@ -103,7 +127,6 @@ class FaceClassifier:
         if not self.is_trained:
             return None
 
-        # Normalize
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
@@ -115,13 +138,11 @@ class FaceClassifier:
 
         all_classes = self.label_encoder.classes_
 
-        # If enrolled_ids provided, mask to only enrolled students
         if enrolled_ids:
             enrolled_set = set(enrolled_ids)
             mask = np.array([cls in enrolled_set for cls in all_classes])
             if not mask.any():
                 return None
-            # Zero out non-enrolled, renormalize
             masked_probs = probs * mask
             total = masked_probs.sum()
             if total > 0:

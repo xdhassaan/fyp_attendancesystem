@@ -7,10 +7,17 @@ import os
 import logging
 from contextlib import asynccontextmanager
 
+# Load .env (camera credentials, etc.) before anything else touches env vars.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+except Exception:
+    pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import recognition, encodings, health
+from app.api.routes import recognition, encodings, health, camera, feedback
 from app.services.model_loader import model_loader
 
 # Configure logging
@@ -51,3 +58,5 @@ app.add_middleware(
 app.include_router(health.router, tags=["Health"])
 app.include_router(recognition.router, prefix="/api/v1", tags=["Recognition"])
 app.include_router(encodings.router, prefix="/api/v1", tags=["Encodings"])
+app.include_router(camera.router, prefix="/api/v1", tags=["Camera"])
+app.include_router(feedback.router, prefix="/api/v1", tags=["Feedback"])

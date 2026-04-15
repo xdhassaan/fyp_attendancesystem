@@ -34,6 +34,12 @@ ai-service/storage/
 ai-service/encodings/
 ai-service/svm_model/
 
+# Model backups (kept locally for rollback during experiments, not for git)
+ai-service/models/backup/
+ai-service/models/before_semihard/
+ai-service/feedback/
+ai-service/output/
+
 # Dataset & training data (too large for git)
 Data received/
 Data received.zip
@@ -52,12 +58,14 @@ backend/storage/
 Thumbs.db
 nul
 
-# Test/output images
+# Test/output images — block stray test artifacts but allow project deliverables
 *.jpg
 *.jpeg
 *.png
 !frontend/public/**
 !presentation_charts/**
+!Poster/**
+!Report/**
 output/
 
 # Logs

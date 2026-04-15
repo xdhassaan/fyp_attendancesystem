@@ -1,6 +1,7 @@
 import { prisma } from '../../config/database';
 import { NotFoundError, ConflictError } from '../../shared/exceptions';
 import { ParsedPagination, notDeleted } from '../../shared/utils/pagination';
+import { logger } from '../../config/logger';
 
 export class StudentsService {
   async create(data: {
@@ -139,6 +140,17 @@ export class StudentsService {
         })
       )
     );
+
+    // Auto-generate encodings for the new images
+    try {
+      const { aiServiceClient } = await import('../../integrations/ai-service/ai-service.client');
+      const imagePaths = files.map((f) => f.path);
+      await aiServiceClient.generateEncodings(studentId, imagePaths);
+      logger.info(`Auto-generated encodings for student ${studentId} (${files.length} images)`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`Encoding generation failed for student ${studentId}: ${message}`);
+    }
 
     return images;
   }

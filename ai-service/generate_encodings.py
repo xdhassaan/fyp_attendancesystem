@@ -48,7 +48,7 @@ def main():
         logger.error(f"Database not found at {DB_PATH}")
         sys.exit(1)
 
-    logger.info("Loading AI models (MTCNN + FaceNet)...")
+    logger.info("Loading AI models (MTCNN + RetinaFace + ArcFace + Facenet512)...")
     model_loader.load_models()
     logger.info("Models loaded successfully.")
 
@@ -132,7 +132,7 @@ def main():
         )
 
         try:
-            encodings = generate_encodings_for_images(valid_paths, augment=True)
+            encodings = generate_encodings_for_images(valid_paths, augment=True, n_variants=8)
 
             if encodings:
                 metadata = {
@@ -140,22 +140,31 @@ def main():
                     "name": name,
                 }
                 encoding_store.save_encodings(student_id, encodings, metadata)
-                total_encodings += len(encodings)
-                students_with_encodings += 1
                 logger.info(f"  -> {len(encodings)} encodings saved")
 
-                # Compute per-student stats for adaptive thresholds
+                # Remove outlier encodings (bad augmentations, misdetections)
+                kept, removed = encoding_store.remove_outlier_encodings(student_id, max_std_devs=1.5)
+                if removed > 0:
+                    logger.info(f"  -> Outlier removal: kept {kept}, removed {removed}")
+
+                total_encodings += kept
+                students_with_encodings += 1
+
+                # Compute per-student stats + centroid for adaptive thresholds
                 stats = encoding_store.compute_student_stats(student_id)
                 if stats:
                     logger.info(
                         f"  -> Stats: mean_intra={stats['mean_intra_dist']:.4f}, "
                         f"max_intra={stats['max_intra_dist']:.4f}, "
+                        f"centroid_spread={stats.get('centroid_spread', 0):.4f}, "
                         f"num_encodings={stats['num_encodings']}"
                     )
 
-                # Collect for SVM training
+                # Collect for SVM training (use cleaned encodings)
                 import numpy as np
-                all_encodings_by_student[student_id] = np.array(encodings)
+                clean_data = encoding_store.get_encodings(student_id)
+                if clean_data and clean_data.get("encodings_np") is not None:
+                    all_encodings_by_student[student_id] = clean_data["encodings_np"]
             else:
                 logger.warning(f"  -> No encodings generated (face detection failed)")
                 students_failed += 1

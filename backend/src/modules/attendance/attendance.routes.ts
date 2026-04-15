@@ -24,4 +24,9 @@ router.get('/attendance/:sessionId', attendanceController.getSessionDetails);
 router.get('/attendance/:sessionId/download-excel', attendanceController.downloadAttendanceSheet);
 router.get('/attendance/history', attendanceController.getHistory);
 
+// Live camera capture
+router.post('/attendance/:sessionId/live/start', attendanceController.startLiveCapture);
+router.post('/attendance/:sessionId/live/stop', attendanceController.stopLiveCapture);
+router.get('/attendance/:sessionId/live/status', attendanceController.getLiveStatus);
+
 export default router;

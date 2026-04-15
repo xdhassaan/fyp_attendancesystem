@@ -1,8 +1,40 @@
 import ExcelJS from 'exceljs';
 import { aiServiceClient, RecognitionResult } from '../../integrations/ai-service/ai-service.client';
 import { logger } from '../../config/logger';
+import { config } from '../../config';
 
 class TestingService {
+  // ── Camera (testing) ──────────────────────────────────────────────────
+  // Testing dashboard uses ALL registered students (no enrollment filter),
+  // so these helpers just fetch every enrolled ID before delegating to the
+  // AI service's camera endpoints.
+
+  async cameraHealth() {
+    return aiServiceClient.cameraHealth();
+  }
+
+  cameraStreamUrl(overlay: boolean = true): string {
+    return aiServiceClient.cameraStreamUrl(overlay);
+  }
+
+  async recognizeFromCamera(threshold?: number): Promise<RecognitionResult> {
+    const allStudentIds = await aiServiceClient.getAllStudentIds();
+    logger.info(`Testing camera recognize: ${allStudentIds.length} students`);
+    return aiServiceClient.recognizeFromCamera(allStudentIds, threshold || 1.1);
+  }
+
+  async startLiveDetection(threshold?: number) {
+    const allStudentIds = await aiServiceClient.getAllStudentIds();
+    return aiServiceClient.startLiveDetection(allStudentIds, threshold || 1.1);
+  }
+
+  async stopLiveDetection() {
+    return aiServiceClient.stopLiveDetection();
+  }
+
+  async setFlash(on: boolean) {
+    return aiServiceClient.setCameraFlash(on);
+  }
   async recognizeImages(
     imagePaths: string[],
     threshold?: number
@@ -19,7 +51,7 @@ class TestingService {
         const result = await aiServiceClient.recognizeFaces(
           imagePath,
           allStudentIds,
-          threshold || 0.6
+          threshold || 1.1
         );
         results.push({ filename, result });
       } catch (err: any) {

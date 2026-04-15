@@ -3,7 +3,7 @@ import fs from 'fs';
 import ExcelJS from 'exceljs';
 import { prisma } from '../../config/database';
 import { config } from '../../config';
-import { NotFoundError, BadRequestError, ForbiddenError } from '../../shared/exceptions';
+import { NotFoundError, BadRequestError, ForbiddenError, AppError } from '../../shared/exceptions';
 import { SessionExistsError, SessionLockedError } from '../../shared/exceptions';
 import { ParsedPagination, notDeleted } from '../../shared/utils/pagination';
 import { aiServiceClient, RecognitionResult } from '../../integrations/ai-service/ai-service.client';
@@ -272,7 +272,7 @@ export class AttendanceService {
       recognitionResult = await aiServiceClient.recognizeFaces(
         imagePath,
         enrolledStudentIds,
-        threshold || 0.6
+        threshold || 1.1
       );
     } catch (error: any) {
       // If AI service is down, store the image but don't process
@@ -343,7 +343,7 @@ export class AttendanceService {
       where: { id: sessionId },
       data: {
         detectionMethod: 'AI_RECOGNITION',
-        recognitionThreshold: threshold || 0.6,
+        recognitionThreshold: threshold || 1.1,
       },
     });
 
@@ -664,6 +664,319 @@ export class AttendanceService {
     }
 
     return session;
+  }
+
+  // ── Live Camera Capture ──────────────────────────────────────────────
+  //
+  // Flow:
+  //   1. Teacher calls startLiveCapture() → we mark the session live and
+  //      schedule a setInterval that hits the AI service every
+  //      CAMERA_SNAPSHOT_INTERVAL_SEC seconds.
+  //   2. Each tick grabs a frame from the camera via the AI service,
+  //      runs recognition, and persists an AttendanceSnapshot row.
+  //   3. Teacher calls stopLiveCapture() → timer is cleared; we tally
+  //      recognizedIds across every snapshot and mark each student
+  //      PRESENT if they appear in >= CAMERA_ATTENDANCE_THRESHOLD fraction
+  //      of snapshots (default 0.6).
+
+  private liveTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  private getLiveConfig() {
+    const interval = parseInt(process.env.CAMERA_SNAPSHOT_INTERVAL_SEC || '60', 10);
+    const threshold = parseFloat(process.env.CAMERA_ATTENDANCE_THRESHOLD || '0.6');
+    const beepLeadMs = parseInt(process.env.CAMERA_PRE_SNAPSHOT_BEEP_MS || '3000', 10);
+    return { intervalMs: interval * 1000, threshold, beepLeadMs };
+  }
+
+  async startLiveCapture(sessionId: string, userId: string) {
+    const session = await this.verifySessionOwnership(sessionId, userId);
+    if (session.status === 'SUBMITTED' || session.status === 'FINALIZED') {
+      throw new SessionLockedError();
+    }
+    if (this.liveTimers.has(sessionId)) {
+      return { alreadyActive: true, sessionId };
+    }
+
+    const health = await aiServiceClient.cameraHealth();
+    if (!health.available) {
+      throw new AppError(
+        `Camera unavailable: ${health.reason || 'unknown'}`,
+        503,
+        'CAMERA_UNAVAILABLE',
+      );
+    }
+
+    await prisma.attendanceSession.update({
+      where: { id: sessionId },
+      data: {
+        liveCaptureActive: true,
+        liveCaptureStartedAt: new Date(),
+        liveCaptureStoppedAt: null,
+        status: 'IN_PROGRESS',
+        detectionMethod: 'LIVE_CAMERA',
+      },
+    });
+
+    // Pull enrolled students once so both the snapshot worker and the live
+    // detection overlay use the same list for this session.
+    const sessionWithEnrolment = await prisma.attendanceSession.findFirst({
+      where: { id: sessionId },
+      include: {
+        courseOffering: {
+          include: {
+            studentEnrollments: {
+              where: { status: 'enrolled' },
+              include: { student: true },
+            },
+          },
+        },
+      },
+    });
+    const enrolledIds = sessionWithEnrolment
+      ? sessionWithEnrolment.courseOffering.studentEnrollments.map((e) => e.studentId)
+      : [];
+
+    // Turn on the virtual "flash" (CLAHE brightness boost) so all frames
+    // consumed during this session — preview, snapshots, and live detection —
+    // are lifted to recognition-friendly brightness.
+    await aiServiceClient.setCameraFlash(true);
+
+    // Start the live overlay worker (runs at ~1 Hz, draws boxes on the stream)
+    await aiServiceClient.startLiveDetection(enrolledIds, 1.1);
+
+    // Delay the FIRST snapshot by `beepLeadMs` so the frontend can play a
+    // 3-second countdown beep (a software stand-in for the camera's alarm,
+    // which IMOU locks behind their Cloud API). Subsequent snapshots fire on
+    // the regular interval; the frontend plays the countdown 3s before each.
+    const { intervalMs } = this.getLiveConfig();
+    const beepLeadMs = parseInt(process.env.CAMERA_PRE_SNAPSHOT_BEEP_MS || '3000', 10);
+
+    const firstTimer = setTimeout(() => {
+      this.captureOneSnapshot(sessionId).catch((e) =>
+        logger.warn(`Initial snapshot failed for session ${sessionId}:`, e?.message),
+      );
+      const recurring = setInterval(() => {
+        this.captureOneSnapshot(sessionId).catch((e) =>
+          logger.warn(`Snapshot failed for session ${sessionId}:`, e?.message),
+        );
+      }, intervalMs);
+      this.liveTimers.set(sessionId, recurring);
+    }, beepLeadMs);
+    // Store the initial timeout so Stop during the 3s window can clear it.
+    // The entry will be overwritten by the recurring interval after the
+    // first fire. clearTimeout/clearInterval are interchangeable in Node.
+    this.liveTimers.set(sessionId, firstTimer);
+
+    return {
+      sessionId,
+      intervalSec: intervalMs / 1000,
+      preSnapshotBeepMs: beepLeadMs,
+      cameraResolution: { width: health.width, height: health.height },
+      streamUrl: aiServiceClient.cameraStreamUrl(),
+    };
+  }
+
+  private async captureOneSnapshot(sessionId: string) {
+    const session = await prisma.attendanceSession.findFirst({
+      where: { id: sessionId },
+      include: {
+        courseOffering: {
+          include: {
+            studentEnrollments: {
+              where: { status: 'enrolled' },
+              include: { student: true },
+            },
+          },
+        },
+      },
+    });
+    if (!session || !session.liveCaptureActive) return;
+
+    const enrolledIds = session.courseOffering.studentEnrollments.map(
+      (e) => e.studentId,
+    );
+
+    let result: RecognitionResult;
+    try {
+      // Multi-frame voting (Tier 1.5): capture 3 frames 1s apart, vote on
+      // students that appear in >= 50%. More stable than a single frame.
+      const burstFrames = parseInt(process.env.CAMERA_SNAPSHOT_BURST_FRAMES || '3', 10);
+      result = await aiServiceClient.recognizeFromCamera(enrolledIds, 1.1, {
+        frames: burstFrames,
+        frameIntervalSec: 1.0,
+        voteMinFraction: 0.5,
+      });
+    } catch (err: any) {
+      logger.warn(`captureOneSnapshot ${sessionId}: ${err?.message}`);
+      await prisma.attendanceSnapshot.create({
+        data: {
+          sessionId,
+          facesDetected: 0,
+          facesRecognized: 0,
+          recognizedIds: '[]',
+          metadata: JSON.stringify({ error: err?.message }),
+        },
+      });
+      return;
+    }
+
+    const recognizedIds = (result.recognizedStudents || []).map((s) => s.studentId);
+
+    await prisma.attendanceSnapshot.create({
+      data: {
+        sessionId,
+        facesDetected: result.facesDetected,
+        facesRecognized: result.facesRecognized,
+        recognizedIds: JSON.stringify(recognizedIds),
+        metadata: JSON.stringify({
+          processingTimeMs: result.processingTimeMs,
+          threshold: result.metrics?.threshold,
+        }),
+      },
+    });
+  }
+
+  async stopLiveCapture(sessionId: string, userId: string) {
+    const session = await this.verifySessionOwnership(sessionId, userId);
+    if (session.status === 'SUBMITTED' || session.status === 'FINALIZED') {
+      throw new SessionLockedError();
+    }
+
+    const timer = this.liveTimers.get(sessionId);
+    if (timer) {
+      clearInterval(timer);
+      this.liveTimers.delete(sessionId);
+    }
+
+    // Stop the live overlay worker (keeps CPU idle when not in a session)
+    await aiServiceClient.stopLiveDetection();
+
+    // Turn off the virtual flash
+    await aiServiceClient.setCameraFlash(false);
+
+    await prisma.attendanceSession.update({
+      where: { id: sessionId },
+      data: {
+        liveCaptureActive: false,
+        liveCaptureStoppedAt: new Date(),
+      },
+    });
+
+    return this.tallySnapshotsAndApply(sessionId);
+  }
+
+  async getLiveStatus(sessionId: string, userId: string) {
+    await this.verifySessionOwnership(sessionId, userId);
+    const session = await prisma.attendanceSession.findFirst({
+      where: { id: sessionId },
+    });
+    if (!session) throw new NotFoundError('Session not found');
+
+    const snapshots = await prisma.attendanceSnapshot.findMany({
+      where: { sessionId },
+      orderBy: { capturedAt: 'desc' },
+      take: 20,
+    });
+
+    const totalSnapshots = await prisma.attendanceSnapshot.count({
+      where: { sessionId },
+    });
+
+    // Running tally
+    const allSnaps = await prisma.attendanceSnapshot.findMany({
+      where: { sessionId },
+      select: { recognizedIds: true },
+    });
+    const counts: Record<string, number> = {};
+    for (const s of allSnaps) {
+      try {
+        const ids: string[] = JSON.parse(s.recognizedIds);
+        for (const id of ids) counts[id] = (counts[id] || 0) + 1;
+      } catch {}
+    }
+
+    const { threshold, intervalMs, beepLeadMs } = this.getLiveConfig();
+
+    return {
+      active: session.liveCaptureActive,
+      startedAt: session.liveCaptureStartedAt,
+      stoppedAt: session.liveCaptureStoppedAt,
+      totalSnapshots,
+      threshold,
+      intervalMs,
+      preSnapshotBeepMs: beepLeadMs,
+      recentSnapshots: snapshots.map((s) => ({
+        id: s.id,
+        capturedAt: s.capturedAt,
+        facesDetected: s.facesDetected,
+        facesRecognized: s.facesRecognized,
+      })),
+      tally: Object.entries(counts)
+        .map(([studentId, count]) => ({
+          studentId,
+          count,
+          rate: totalSnapshots > 0 ? count / totalSnapshots : 0,
+          wouldBePresent: totalSnapshots > 0 && count / totalSnapshots >= threshold,
+        }))
+        .sort((a, b) => b.count - a.count),
+    };
+  }
+
+  private async tallySnapshotsAndApply(sessionId: string) {
+    const allSnaps = await prisma.attendanceSnapshot.findMany({
+      where: { sessionId },
+      select: { recognizedIds: true },
+    });
+
+    const totalSnapshots = allSnaps.length;
+    const counts: Record<string, number> = {};
+    for (const s of allSnaps) {
+      try {
+        const ids: string[] = JSON.parse(s.recognizedIds);
+        // Dedup within a single snapshot
+        for (const id of new Set(ids)) {
+          counts[id] = (counts[id] || 0) + 1;
+        }
+      } catch {}
+    }
+
+    const { threshold } = this.getLiveConfig();
+    const presentIds = new Set<string>();
+    for (const [id, count] of Object.entries(counts)) {
+      if (totalSnapshots > 0 && count / totalSnapshots >= threshold) {
+        presentIds.add(id);
+      }
+    }
+
+    // Update AttendanceRecord rows in a single batch
+    const records = await prisma.attendanceRecord.findMany({
+      where: { attendanceSessionId: sessionId },
+    });
+    const updates = records.map((r) =>
+      prisma.attendanceRecord.update({
+        where: { id: r.id },
+        data: {
+          status: presentIds.has(r.studentId) ? 'PRESENT' : 'ABSENT',
+          markedBy: 'automatic',
+        },
+      }),
+    );
+    await prisma.$transaction(updates);
+
+    return {
+      totalSnapshots,
+      threshold,
+      markedPresent: presentIds.size,
+      markedAbsent: records.length - presentIds.size,
+      perStudent: Object.entries(counts)
+        .map(([studentId, count]) => ({
+          studentId,
+          count,
+          rate: totalSnapshots > 0 ? count / totalSnapshots : 0,
+          present: presentIds.has(studentId),
+        }))
+        .sort((a, b) => b.count - a.count),
+    };
   }
 }
 

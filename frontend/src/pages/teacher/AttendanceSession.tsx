@@ -2,10 +2,15 @@ import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import api, { getErrorMessage } from '../../lib/api';
 import { PageHeader } from '../../components/ui/PageHeader';
-import { Upload, Check, X, Send, Camera, ArrowLeft, AlertCircle, BarChart3, Download } from 'lucide-react';
+import { Check, X, Send, Camera, ArrowLeft, AlertCircle, BarChart3, Download, Video, VideoOff, Play, Square } from 'lucide-react';
 import clsx from 'clsx';
+import { playCountdownBeeps, primeAudio } from '../../lib/audio';
 
 type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'LATE' | 'EXCUSED';
+
+// AI service base URL for direct MJPEG stream access.
+// Uses VITE_AI_SERVICE_URL env var if set, else falls back to the dev default.
+const AI_SERVICE_URL = (import.meta as any).env?.VITE_AI_SERVICE_URL || 'http://localhost:8000';
 
 export default function AttendanceSession() {
   const { scheduleId } = useParams<{ scheduleId: string }>();
@@ -20,6 +25,18 @@ export default function AttendanceSession() {
   const [uploading, setUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [aiResult, setAiResult] = useState<any>(null);
+
+  // Live camera state
+  const [liveActive, setLiveActive] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<any>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [showUploadFallback, setShowUploadFallback] = useState(false);
+  const livePollRef = useRef<number | null>(null);
+  // Beep-countdown timer. Fires immediately + every intervalMs so the
+  // 3-beep warning plays exactly `preSnapshotBeepMs` (default 3s) before
+  // each snapshot. Backend delays its first snapshot by the same amount.
+  const beepTimerRef = useRef<number | null>(null);
+  const [beepCountdown, setBeepCountdown] = useState(0); // for visual "3.. 2.. 1.." pill
 
   useEffect(() => {
     startSession();
@@ -61,6 +78,120 @@ export default function AttendanceSession() {
     const { data } = await api.get(`/teacher/attendance/${sessionId}`);
     setSession(data.data);
     setRecords(data.data.attendanceRecords || []);
+  };
+
+  // ── Live Camera ──────────────────────────────────────────────────────
+
+  useEffect(() => {
+    return () => {
+      // On unmount, clear polling + any scheduled beep. Do NOT auto-stop
+      // server-side capture; leave that to the explicit Stop button.
+      if (livePollRef.current) {
+        window.clearInterval(livePollRef.current);
+        livePollRef.current = null;
+      }
+      if (beepTimerRef.current) {
+        window.clearInterval(beepTimerRef.current);
+        beepTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const runBeepCountdown = (seconds: number) => {
+    // Play one beep per second at T=0, T=1, T=2 (for a 3-second countdown)
+    // and update the visual pill so the teacher sees the countdown too.
+    setBeepCountdown(seconds);
+    playCountdownBeeps(seconds, { spacingMs: 1000 });
+    // Tick the visible number down
+    let remaining = seconds;
+    const ticker = window.setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        setBeepCountdown(0);
+        window.clearInterval(ticker);
+      } else {
+        setBeepCountdown(remaining);
+      }
+    }, 1000);
+  };
+
+  const pollLiveStatus = async () => {
+    if (!session) return;
+    try {
+      const { data } = await api.get(`/teacher/attendance/${session.id}/live/status`);
+      setLiveStatus(data.data);
+      if (data.data.active !== liveActive) {
+        setLiveActive(data.data.active);
+      }
+    } catch (err) {
+      // Silent: polling failures shouldn't spam the user
+    }
+  };
+
+  const handleStartLive = async () => {
+    if (!session || liveLoading) return;
+    setLiveLoading(true);
+    setError('');
+    // A user gesture is required to unlock Web Audio on most browsers —
+    // prime the context now so subsequent beeps play.
+    primeAudio();
+    try {
+      const { data } = await api.post(`/teacher/attendance/${session.id}/live/start`);
+      setLiveActive(true);
+
+      // Pull the authoritative interval + beep-lead from the backend response
+      const intervalMs = (data.data?.intervalSec ?? 60) * 1000;
+      const beepLeadMs = data.data?.preSnapshotBeepMs ?? 3000;
+      const countdownSeconds = Math.max(1, Math.round(beepLeadMs / 1000));
+
+      // Play the first countdown immediately (snapshot fires beepLeadMs later)
+      runBeepCountdown(countdownSeconds);
+
+      // Repeat the countdown every intervalMs so every subsequent snapshot
+      // gets the same 3-second warning
+      if (beepTimerRef.current) window.clearInterval(beepTimerRef.current);
+      beepTimerRef.current = window.setInterval(() => {
+        runBeepCountdown(countdownSeconds);
+      }, intervalMs);
+
+      // Start polling every 5s for running tally
+      if (livePollRef.current) window.clearInterval(livePollRef.current);
+      livePollRef.current = window.setInterval(pollLiveStatus, 5000);
+      await pollLiveStatus();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLiveLoading(false);
+    }
+  };
+
+  const handleStopLive = async () => {
+    if (!session || liveLoading) return;
+    setLiveLoading(true);
+    try {
+      const { data } = await api.post(`/teacher/attendance/${session.id}/live/stop`);
+      setLiveActive(false);
+      if (livePollRef.current) {
+        window.clearInterval(livePollRef.current);
+        livePollRef.current = null;
+      }
+      if (beepTimerRef.current) {
+        window.clearInterval(beepTimerRef.current);
+        beepTimerRef.current = null;
+      }
+      setBeepCountdown(0);
+      // Show the tally result
+      setAiResult({
+        liveTally: data.data,
+        aiServiceAvailable: true,
+      });
+      // Refresh records from server to pick up PRESENT/ABSENT updates
+      await fetchSessionDetails(session.id);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLiveLoading(false);
+    }
   };
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -193,42 +324,193 @@ export default function AttendanceSession() {
         </div>
       </div>
 
-      {/* Image upload area */}
+      {/* Capture area: live camera + upload fallback */}
       {!isLocked && (
-        <div className="mb-6">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            onChange={handleImageUpload}
-            className="hidden"
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            className="w-full flex items-center justify-center gap-3 py-6 glass-md border-2 border-dashed border-white/10 hover:border-maroon-600/30 hover:bg-maroon-700/5 rounded-xl transition-colors disabled:opacity-50"
-          >
-            {uploading ? (
-              <>
-                <div className="w-5 h-5 border-2 border-maroon-700/30 border-t-maroon-600 rounded-full animate-spin" />
-                <span className="text-sm text-white/50">Processing image with AI...</span>
-              </>
-            ) : (
-              <>
-                <Camera size={24} className="text-white/50" />
-                <span className="text-sm text-white/50">
-                  <span className="text-maroon-400 font-medium">Upload class photo</span> for automatic recognition
+        <div className="mb-6 space-y-3">
+          {/* Live camera block */}
+          <div className="glass-md rounded-xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-white/[0.06] flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Video size={16} className={liveActive ? 'text-red-400' : 'text-white/50'} />
+                <span className="text-sm font-semibold text-white/80">
+                  {liveActive ? 'Live capture active' : 'Live classroom camera'}
                 </span>
-              </>
-            )}
-          </button>
+                {liveActive && (
+                  <span className="flex items-center gap-1.5 ml-2">
+                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                    <span className="text-xs text-red-400 uppercase font-semibold tracking-wide">LIVE</span>
+                  </span>
+                )}
+                {beepCountdown > 0 && (
+                  <span className="flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-500/30">
+                    <span className="text-xs font-bold text-amber-300 tabular-nums">
+                      📸 Capturing in {beepCountdown}...
+                    </span>
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {!liveActive ? (
+                  <button
+                    onClick={handleStartLive}
+                    disabled={liveLoading}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-lg bg-gradient-to-r from-green-600 to-green-700 hover:from-green-500 hover:to-green-600 text-white text-xs font-medium disabled:opacity-50"
+                  >
+                    <Play size={14} /> {liveLoading ? 'Starting...' : 'Start Attendance'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleStopLive}
+                    disabled={liveLoading}
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-lg bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 text-white text-xs font-medium disabled:opacity-50"
+                  >
+                    <Square size={14} /> {liveLoading ? 'Stopping...' : 'Stop Attendance'}
+                  </button>
+                )}
+              </div>
+            </div>
 
-          {aiResult && (
+            {/* Video feed */}
+            <div className="bg-black/50 relative aspect-video flex items-center justify-center">
+              {liveActive ? (
+                <img
+                  src={`${AI_SERVICE_URL}/api/v1/camera/stream`}
+                  alt="Classroom camera live feed"
+                  className="w-full h-full object-contain"
+                />
+              ) : (
+                <div className="flex flex-col items-center gap-2 text-white/30">
+                  <VideoOff size={32} />
+                  <p className="text-xs">Camera feed will appear when attendance starts</p>
+                </div>
+              )}
+            </div>
+
+            {/* Live tally */}
+            {liveActive && liveStatus && (
+              <div className="px-4 py-3 border-t border-white/[0.06] bg-black/20">
+                <div className="flex items-center justify-between gap-4 text-xs mb-2">
+                  <div className="flex items-center gap-4">
+                    <span className="text-white/60">
+                      <span className="text-white/90 font-semibold">{liveStatus.totalSnapshots}</span> snapshots taken
+                    </span>
+                    <span className="text-white/40">
+                      threshold: {(liveStatus.threshold * 100).toFixed(0)}% of snapshots
+                    </span>
+                  </div>
+                  <span className="text-white/40">Next snapshot in ~{60 - Math.floor(((Date.now() - new Date(liveStatus.startedAt).getTime()) / 1000) % 60)}s</span>
+                </div>
+                {liveStatus.tally && liveStatus.tally.length > 0 && (
+                  <div className="max-h-32 overflow-y-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-white/30">
+                          <th className="text-left font-medium py-1">Student</th>
+                          <th className="text-right font-medium py-1 w-24">Appearances</th>
+                          <th className="text-right font-medium py-1 w-20">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {liveStatus.tally.slice(0, 10).map((t: any) => {
+                          const rec = records.find((r) => r.studentId === t.studentId);
+                          return (
+                            <tr key={t.studentId} className="border-t border-white/[0.04]">
+                              <td className="py-1 text-white/70">
+                                {rec?.student ? `${rec.student.firstName} ${rec.student.lastName}` : t.studentId.slice(0, 8)}
+                              </td>
+                              <td className="py-1 text-right text-white/50 font-mono">
+                                {t.count}/{liveStatus.totalSnapshots} ({(t.rate * 100).toFixed(0)}%)
+                              </td>
+                              <td className="py-1 text-right">
+                                <span className={clsx('px-1.5 py-0.5 rounded-full text-[10px] font-medium', t.wouldBePresent ? 'bg-green-500/20 text-green-400' : 'bg-amber-500/20 text-amber-400')}>
+                                  {t.wouldBePresent ? 'PRESENT' : 'NOT YET'}
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Upload fallback */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowUploadFallback((s) => !s)}
+              className="text-xs text-white/40 hover:text-white/70 transition-colors"
+            >
+              {showUploadFallback ? '▼' : '▸'} Upload a photo instead (fallback)
+            </button>
+            {showUploadFallback && (
+              <div className="mt-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleImageUpload}
+                  className="hidden"
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading || liveActive}
+                  className="w-full flex items-center justify-center gap-3 py-4 glass border-2 border-dashed border-white/10 hover:border-maroon-600/30 hover:bg-maroon-700/5 rounded-xl transition-colors disabled:opacity-50"
+                >
+                  {uploading ? (
+                    <>
+                      <div className="w-5 h-5 border-2 border-maroon-700/30 border-t-maroon-600 rounded-full animate-spin" />
+                      <span className="text-sm text-white/50">Processing image with AI...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Camera size={20} className="text-white/50" />
+                      <span className="text-sm text-white/50">
+                        <span className="text-maroon-400 font-medium">Upload class photo</span>
+                      </span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {aiResult && !aiResult.liveTally && (
             <div className="mt-2 text-sm text-white/70 glass bg-maroon-700/5 border-maroon-600/10 rounded-lg px-4 py-2">
               {aiResult.aiServiceAvailable
                 ? `AI detected ${aiResult.facesDetected} faces, recognized ${aiResult.facesRecognized} students (${aiResult.processingTimeMs}ms)`
                 : aiResult.message
               }
+            </div>
+          )}
+
+          {aiResult?.liveTally && (
+            <div className="mt-2 glass rounded-xl overflow-hidden">
+              <div className="px-4 py-2 border-b border-white/[0.06] flex items-center gap-2">
+                <Check size={14} className="text-green-400" />
+                <span className="text-xs text-white/60 uppercase font-semibold">Live Capture Complete</span>
+              </div>
+              <div className="grid grid-cols-4 gap-px bg-white/[0.04]">
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase">Snapshots Taken</p>
+                  <p className="text-lg font-bold text-white/90">{aiResult.liveTally.totalSnapshots}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase">Threshold</p>
+                  <p className="text-lg font-bold text-white/90">{(aiResult.liveTally.threshold * 100).toFixed(0)}%</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase">Marked Present</p>
+                  <p className="text-lg font-bold text-green-400">{aiResult.liveTally.markedPresent}</p>
+                </div>
+                <div className="bg-[#0a0a0f] px-4 py-3">
+                  <p className="text-white/30 text-[10px] uppercase">Marked Absent</p>
+                  <p className="text-lg font-bold text-red-400">{aiResult.liveTally.markedAbsent}</p>
+                </div>
+              </div>
             </div>
           )}
 

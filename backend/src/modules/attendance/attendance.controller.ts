@@ -126,6 +126,26 @@ export class AttendanceController {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     return res.send(buffer);
   });
+
+  // ── Live Camera ──────────────────────────────────────────────────────
+
+  startLiveCapture = asyncHandler(async (req: Request, res: Response) => {
+    const userId = (req as AuthenticatedRequest).user!.id;
+    const result = await attendanceService.startLiveCapture(req.params.sessionId, userId);
+    return sendSuccess(res, result, 'Live capture started');
+  });
+
+  stopLiveCapture = asyncHandler(async (req: Request, res: Response) => {
+    const userId = (req as AuthenticatedRequest).user!.id;
+    const result = await attendanceService.stopLiveCapture(req.params.sessionId, userId);
+    return sendSuccess(res, result, 'Live capture stopped and attendance tallied');
+  });
+
+  getLiveStatus = asyncHandler(async (req: Request, res: Response) => {
+    const userId = (req as AuthenticatedRequest).user!.id;
+    const status = await attendanceService.getLiveStatus(req.params.sessionId, userId);
+    return sendSuccess(res, status);
+  });
 }
 
 export const attendanceController = new AttendanceController();

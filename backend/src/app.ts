@@ -74,10 +74,10 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
-// Stricter rate limit for auth endpoints
+// Stricter rate limit for auth endpoints (relaxed in development for testing)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 attempts per window
+  max: config.isProduction ? 10 : 200,
   message: {
     success: false,
     error: {

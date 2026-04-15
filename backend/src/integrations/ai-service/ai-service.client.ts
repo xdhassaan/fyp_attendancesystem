@@ -86,7 +86,7 @@ class AIServiceClient {
   async recognizeFaces(
     imagePath: string,
     enrolledStudentIds: string[],
-    threshold: number = 0.6
+    threshold: number = 1.1
   ): Promise<RecognitionResult> {
     try {
       const formData = new FormData();
@@ -110,6 +110,90 @@ class AIServiceClient {
         );
       }
       throw new AppError('Face recognition service failed', 502, 'AI_SERVICE_ERROR');
+    }
+  }
+
+  async recognizeFromCamera(
+    enrolledStudentIds: string[],
+    threshold: number = 1.1,
+    opts: { frames?: number; frameIntervalSec?: number; voteMinFraction?: number } = {}
+  ): Promise<RecognitionResult> {
+    try {
+      const formData = new FormData();
+      formData.append('student_ids', JSON.stringify(enrolledStudentIds));
+      formData.append('threshold', threshold.toString());
+      if (opts.frames !== undefined) formData.append('frames', String(opts.frames));
+      if (opts.frameIntervalSec !== undefined) formData.append('frame_interval_sec', String(opts.frameIntervalSec));
+      if (opts.voteMinFraction !== undefined) formData.append('vote_min_fraction', String(opts.voteMinFraction));
+
+      const response = await this.client.post('/api/v1/camera/recognize', formData, {
+        headers: formData.getHeaders(),
+        timeout: config.aiService.timeout,
+      });
+
+      return response.data;
+    } catch (error: any) {
+      logger.error('Camera recognition failed:', error?.message);
+      if (error?.response?.status === 503) {
+        throw new AppError('Camera not available', 503, 'CAMERA_UNAVAILABLE');
+      }
+      if (error?.response?.status === 504) {
+        throw new AppError('Camera timeout - no frame received', 504, 'CAMERA_TIMEOUT');
+      }
+      throw new AppError('Camera recognition failed', 502, 'AI_SERVICE_ERROR');
+    }
+  }
+
+  async cameraHealth(): Promise<{ available: boolean; reason?: string; width?: number; height?: number }> {
+    try {
+      const response = await this.client.get('/api/v1/camera/health', { timeout: 10000 });
+      return response.data;
+    } catch {
+      return { available: false, reason: 'ai_service_unreachable' };
+    }
+  }
+
+  /** URL the frontend can hit directly for the MJPEG preview. */
+  cameraStreamUrl(overlay: boolean = true): string {
+    return `${config.aiService.url}/api/v1/camera/stream?overlay=${overlay ? 1 : 0}`;
+  }
+
+  async startLiveDetection(enrolledStudentIds: string[], threshold: number = 1.1): Promise<any> {
+    try {
+      const formData = new FormData();
+      formData.append('student_ids', JSON.stringify(enrolledStudentIds));
+      formData.append('threshold', threshold.toString());
+      const response = await this.client.post('/api/v1/camera/live-detection/start', formData, {
+        headers: formData.getHeaders(),
+        timeout: 15000,
+      });
+      return response.data;
+    } catch (error: any) {
+      logger.warn('Start live detection failed:', error?.message);
+      return { running: false, reason: 'request_failed' };
+    }
+  }
+
+  async stopLiveDetection(): Promise<any> {
+    try {
+      const response = await this.client.post('/api/v1/camera/live-detection/stop', null, {
+        timeout: 10000,
+      });
+      return response.data;
+    } catch (error: any) {
+      logger.warn('Stop live detection failed:', error?.message);
+      return { running: false };
+    }
+  }
+
+  async setCameraFlash(on: boolean): Promise<any> {
+    try {
+      const url = on ? '/api/v1/camera/flash/on' : '/api/v1/camera/flash/off';
+      const response = await this.client.post(url, null, { timeout: 5000 });
+      return response.data;
+    } catch (error: any) {
+      logger.warn(`Set flash ${on ? 'on' : 'off'} failed:`, error?.message);
+      return { flashOn: false, error: error?.message };
     }
   }
 

@@ -24,7 +24,7 @@ export const config = {
   aiService: {
     url: process.env.AI_SERVICE_URL || 'http://localhost:8000',
     apiKey: process.env.AI_SERVICE_API_KEY || '',
-    timeout: parseInt(process.env.AI_SERVICE_TIMEOUT || '60000', 10),
+    timeout: parseInt(process.env.AI_SERVICE_TIMEOUT || '300000', 10),
   },
 
   // File Storage

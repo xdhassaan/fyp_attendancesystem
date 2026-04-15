@@ -7,7 +7,8 @@ import os
 import json
 import base64
 import logging
-import tempfile
+import asyncio
+from functools import partial
 from typing import Optional
 
 import cv2
@@ -27,14 +28,14 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.pa
 async def recognize_faces(
     image: UploadFile = File(...),
     student_ids: str = Form("[]"),
-    threshold: float = Form(0.6),
+    threshold: float = Form(1.1),
 ):
     """
     Process a class photo for face recognition.
 
     - **image**: Class photo (JPEG/PNG)
     - **student_ids**: JSON array of enrolled student IDs
-    - **threshold**: Recognition threshold (0.3-1.0, default 0.6)
+    - **threshold**: Recognition threshold (default 1.0 for projected 128-d embeddings)
     """
     if not model_loader.is_loaded:
         raise HTTPException(status_code=503, detail="Models are still loading")
@@ -59,15 +60,25 @@ async def recognize_faces(
 
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+    # Resize large images for detection speed (MTCNN is O(n²) on pixels)
+    MAX_DIM = 2048
+    h, w = img_rgb.shape[:2]
+    if max(h, w) > MAX_DIM:
+        scale = MAX_DIM / max(h, w)
+        img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
     # Determine output directory for annotated image
     output_dir = os.path.join(BASE_DIR, "output", "annotated")
 
-    # Run recognition
-    result = recognize_faces_in_image(
-        img_rgb,
-        enrolled_student_ids=enrolled_ids,
-        threshold=threshold,
-        output_dir=output_dir,
+    # Run CPU-bound recognition in thread pool so event loop stays responsive
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        partial(recognize_faces_in_image,
+                img_rgb,
+                enrolled_student_ids=enrolled_ids,
+                threshold=threshold,
+                output_dir=output_dir)
     )
 
     if result["facesDetected"] == 0:

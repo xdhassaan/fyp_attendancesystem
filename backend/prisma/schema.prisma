@@ -385,9 +385,33 @@ model AttendanceSession {
   markedBy                User          @relation("MarkedBy", fields: [markedById], references: [id], onDelete: Restrict)
   attendanceRecords       AttendanceRecord[]
   attendanceImages        AttendanceImage[]
+  liveSnapshots           AttendanceSnapshot[]
+  liveCaptureActive       Boolean   @default(false) @map("live_capture_active")
+  liveCaptureStartedAt    DateTime? @map("live_capture_started_at")
+  liveCaptureStoppedAt    DateTime? @map("live_capture_stopped_at")
 
   @@unique([courseOfferingId, sessionDate, scheduleId])
   @@map("attendance_sessions")
+}
+
+/// Per-minute snapshots taken by the camera during a live attendance session.
+/// On stop, the backend tallies recognizedIds across all snapshots and marks
+/// a student PRESENT iff they appear in >= threshold (default 60%) of snapshots.
+model AttendanceSnapshot {
+  id              String   @id @default(uuid())
+  sessionId       String   @map("session_id")
+  capturedAt      DateTime @default(now()) @map("captured_at")
+  imagePath       String?  @map("image_path")
+  facesDetected   Int      @default(0) @map("faces_detected")
+  facesRecognized Int      @default(0) @map("faces_recognized")
+  recognizedIds   String   @default("[]") @map("recognized_ids") // JSON array of student IDs
+  metadata        String?  // JSON blob of raw AI result for debugging
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  session         AttendanceSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("attendance_snapshots")
 }
 
 /// Attendance images (class photos)
